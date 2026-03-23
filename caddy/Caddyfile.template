@@ -1,0 +1,105 @@
+# abs-turbo Caddyfile template
+#
+# Replace {$DOMAIN} with your domain (e.g., audiobooks.example.com)
+#   or use localhost:PORT for local-only access (e.g., localhost:8080)
+# Replace {$ABS_PORT} with your ABS port (default: 8000)
+# Replace {$PROXY_PORT} with moov proxy port (default: 13379)
+# Replace {$IMAGE_CACHE_DIR} with image cache path (default: /var/cache/image-cache)
+#
+# Usage:
+#   1. Copy this file to Caddyfile and replace all {$...} placeholders
+#   2. Or use environment variables:
+#      DOMAIN=audiobooks.example.com ABS_PORT=8000 PROXY_PORT=13379 \
+#      IMAGE_CACHE_DIR=/var/cache/image-cache caddy run
+#
+
+{$DOMAIN} {
+	# Health check endpoint for monitoring
+	handle /health {
+		respond "OK" 200
+	}
+
+	# ============================================================
+	# IMAGES: Serve pre-built WebP from local cache
+	# Bypasses ABS entirely for cover images — fast and lightweight
+	# ============================================================
+
+	# Cover thumbnails (when ?thumb=1 is present)
+	@cover_thumb {
+		path_regexp cover ^/api/items/([^/]+)/cover$
+		query thumb=1
+	}
+	handle @cover_thumb {
+		root * {$IMAGE_CACHE_DIR}
+		rewrite * /{re.cover.1}/cover-thumb.webp
+		header Content-Type "image/webp"
+		header Cache-Control "public, max-age=604800"
+		header Access-Control-Allow-Origin "*"
+		file_server
+	}
+
+	# Full-size covers
+	@cover {
+		path_regexp cover ^/api/items/([^/]+)/cover$
+	}
+	handle @cover {
+		root * {$IMAGE_CACHE_DIR}
+		rewrite * /{re.cover.1}/cover.webp
+		header Content-Type "image/webp"
+		header Cache-Control "public, max-age=86400"
+		header Access-Control-Allow-Origin "*"
+		file_server
+	}
+
+	# Spine images (if you generate spines)
+	@spine_thumb {
+		path_regexp spine ^/api/items/([^/]+)/spine$
+		query thumb=1
+	}
+	handle @spine_thumb {
+		root * {$IMAGE_CACHE_DIR}
+		rewrite * /{re.spine.1}/spine-thumb.webp
+		header Content-Type "image/webp"
+		header Cache-Control "public, max-age=604800"
+		header Access-Control-Allow-Origin "*"
+		file_server
+	}
+
+	@spine {
+		path_regexp spine ^/api/items/([^/]+)/spine$
+	}
+	handle @spine {
+		root * {$IMAGE_CACHE_DIR}
+		rewrite * /{re.spine.1}/spine.webp
+		header Content-Type "image/webp"
+		header Cache-Control "public, max-age=86400"
+		header Access-Control-Allow-Origin "*"
+		file_server
+	}
+
+	# ============================================================
+	# AUDIO: Route through moov proxy for fast playback start
+	# The proxy caches moov atoms and optionally faststart-processes
+	# audio files so clients don't wait for full downloads
+	# ============================================================
+
+	@audiofile {
+		path_regexp audiofile ^/api/items/[^/]+/file/.+$
+	}
+	handle @audiofile {
+		reverse_proxy localhost:{$PROXY_PORT}
+	}
+
+	# ============================================================
+	# ABS: Everything else goes directly to AudiobookShelf
+	# API calls, web UI, login, websocket, etc.
+	# ============================================================
+
+	handle {
+		reverse_proxy localhost:{$ABS_PORT} {
+			# WebSocket support for real-time sync
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}

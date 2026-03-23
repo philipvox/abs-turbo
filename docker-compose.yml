@@ -1,0 +1,118 @@
+# abs-turbo Docker Compose
+#
+# Runs the moov proxy as a sidecar alongside your existing ABS container.
+#
+# IMPORTANT: Your ABS container must share its config directory so the proxy
+# can read the database. If your ABS docker-compose looks like:
+#
+#   audiobookshelf:
+#     image: ghcr.io/advplyr/audiobookshelf:latest
+#     volumes:
+#       - ./abs-config:/config
+#       - /path/to/audiobooks:/audiobooks
+#
+# Then either:
+#   (a) Set ABS_CONFIG_DIR in your .env to match ABS's config path (e.g., ./abs-config)
+#   (b) Or use a named volume and set it as external here
+#
+# The proxy needs read-only access to:
+#   - The ABS database (absdatabase.sqlite) for book metadata lookups
+#   - The audiobook files for moov atom extraction and faststart processing
+#
+# Quick start:
+#   1. cp .env.example .env
+#   2. Edit .env with your paths
+#   3. docker compose up -d
+
+services:
+  abs-proxy:
+    build: ./proxy
+    container_name: abs-turbo-proxy
+    ports:
+      - "${PROXY_PORT:-13379}:${PROXY_PORT:-13379}"
+    volumes:
+      # ABS config (read-only) — must contain absdatabase.sqlite
+      # Point this to the same config directory your ABS container uses
+      - ${ABS_CONFIG_DIR:-./abs-config}:/config:ro
+
+      # Audiobook files (read-only) — same mount path as ABS
+      - ${AUDIOBOOKS_DIR:-/mnt/audiobooks}:/audiobooks:ro
+
+      # Cache volumes (read-write) — these persist across container restarts
+      - moov-cache:/cache/moov
+      - faststart-cache:/cache/faststart
+    environment:
+      # How the proxy reaches ABS (use Docker service name if in same compose,
+      # or host.docker.internal if ABS is in a separate compose file)
+      - ABS_URL=${ABS_URL:-http://host.docker.internal:8000}
+      - ABS_DB=/config/absdatabase.sqlite
+      - AUDIOBOOKS_DIR=/audiobooks
+      - MOOV_CACHE_DIR=/cache/moov
+      - FASTSTART_CACHE_DIR=/cache/faststart
+      - PROXY_PORT=${PROXY_PORT:-13379}
+      - FASTSTART_MAX_GB=${FASTSTART_MAX_GB:-30}
+      - FASTSTART_MAX_DAYS=${FASTSTART_MAX_DAYS:-30}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${PROXY_PORT:-13379}/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================
+  # Optional: Image cache builder (run once, then on-demand)
+  # ============================================================
+  # Build the WebP cover cache. Run manually with:
+  #   docker compose run --rm image-cache-builder
+  #   docker compose run --rm image-cache-builder --force    # rebuild all
+  #
+  image-cache-builder:
+    build:
+      context: ./image-cache
+      dockerfile: Dockerfile
+    volumes:
+      - ${ABS_CONFIG_DIR:-./abs-config}:/config:ro
+      - ${IMAGE_CACHE_DIR:-./image-cache-data}:/var/cache/image-cache
+    environment:
+      - ABS_DB=/config/absdatabase.sqlite
+      - ABS_METADATA=/config/metadata
+      - IMAGE_CACHE_DIR=/var/cache/image-cache
+    profiles:
+      - tools  # Only runs when explicitly requested
+
+volumes:
+  moov-cache:
+    driver: local
+  faststart-cache:
+    driver: local
+
+# ============================================================
+# Using with an existing ABS compose file
+# ============================================================
+#
+# If ABS is defined in a SEPARATE docker-compose file, you have two options:
+#
+# Option 1: Use host.docker.internal (default above)
+#   ABS_URL defaults to http://host.docker.internal:8000
+#   This works if ABS publishes port 8000 on the host.
+#
+# Option 2: Share a Docker network
+#   Add to both compose files:
+#     networks:
+#       abs-net:
+#         external: true
+#   Create the network: docker network create abs-net
+#   Then set ABS_URL=http://audiobookshelf:8000
+#
+# If ABS is in the SAME docker-compose file, add it here:
+#
+#   audiobookshelf:
+#     image: ghcr.io/advplyr/audiobookshelf:latest
+#     ports:
+#       - "8000:80"
+#     volumes:
+#       - ./abs-config:/config
+#       - ${AUDIOBOOKS_DIR:-/mnt/audiobooks}:/audiobooks
+#     restart: unless-stopped
+#
+# Then change ABS_URL to: http://audiobookshelf:80

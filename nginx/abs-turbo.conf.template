@@ -1,0 +1,160 @@
+# abs-turbo nginx configuration template
+#
+# Replace the following placeholders before use:
+#   YOUR_DOMAIN          - Your domain (e.g., audiobooks.example.com)
+#   ABS_PORT             - AudiobookShelf port (default: 8000)
+#   PROXY_PORT           - Moov proxy port (default: 13379)
+#   /var/cache/image-cache - Image cache directory path
+#   /etc/ssl/certs/...   - Your SSL certificate paths (or remove ssl block for HTTP-only)
+#
+# Installation:
+#   1. Copy to /etc/nginx/sites-available/abs-turbo.conf
+#   2. Replace all placeholders
+#   3. ln -s /etc/nginx/sites-available/abs-turbo.conf /etc/nginx/sites-enabled/
+#   4. nginx -t && systemctl reload nginx
+#
+
+upstream abs_backend {
+    server 127.0.0.1:ABS_PORT;
+    keepalive 32;
+}
+
+upstream moov_proxy {
+    server 127.0.0.1:PROXY_PORT;
+    keepalive 16;
+}
+
+# Rate limiting zone for API requests (optional, adjust as needed)
+# limit_req_zone $binary_remote_addr zone=abs_api:10m rate=30r/s;
+
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;
+
+    # Redirect HTTP to HTTPS (remove this block if not using SSL)
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name YOUR_DOMAIN;
+
+    # SSL configuration — replace with your cert paths
+    # If using Let's Encrypt with certbot, these are typically:
+    #   ssl_certificate /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
+    #   ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
+    ssl_certificate /etc/ssl/certs/YOUR_DOMAIN.pem;
+    ssl_certificate_key /etc/ssl/private/YOUR_DOMAIN.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    # Maximum upload size (for uploading audiobooks via ABS UI)
+    client_max_body_size 2G;
+
+    # Gzip compression for API responses
+    gzip on;
+    gzip_types application/json text/plain application/javascript text/css;
+    gzip_min_length 1000;
+
+    # ============================================================
+    # Health check
+    # ============================================================
+
+    location = /health {
+        return 200 "OK\n";
+        add_header Content-Type text/plain;
+    }
+
+    # ============================================================
+    # IMAGES: Serve pre-built WebP from local cache
+    # ============================================================
+
+    # Cover thumbnails (when ?thumb=1 is present)
+    location ~ ^/api/items/([^/]+)/cover$ {
+        # Check for thumb parameter
+        set $item_uuid $1;
+        set $cache_file "cover.webp";
+
+        if ($arg_thumb = "1") {
+            set $cache_file "cover-thumb.webp";
+        }
+
+        alias /var/cache/image-cache/$item_uuid/$cache_file;
+
+        add_header Content-Type "image/webp" always;
+        add_header Cache-Control "public, max-age=86400" always;
+        add_header Access-Control-Allow-Origin "*" always;
+
+        # If the cached file doesn't exist, fall back to ABS
+        error_page 404 = @abs_fallback;
+    }
+
+    # Spine images
+    location ~ ^/api/items/([^/]+)/spine$ {
+        set $item_uuid $1;
+        set $spine_file "spine.webp";
+
+        if ($arg_thumb = "1") {
+            set $spine_file "spine-thumb.webp";
+        }
+
+        alias /var/cache/image-cache/$item_uuid/$spine_file;
+
+        add_header Content-Type "image/webp" always;
+        add_header Cache-Control "public, max-age=86400" always;
+        add_header Access-Control-Allow-Origin "*" always;
+
+        error_page 404 = @abs_fallback;
+    }
+
+    # ============================================================
+    # AUDIO: Route through moov proxy for fast playback start
+    # ============================================================
+
+    location ~ ^/api/items/[^/]+/file/.+ {
+        proxy_pass http://moov_proxy;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Audio files can be large — increase timeouts
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_buffering off;
+    }
+
+    # ============================================================
+    # ABS: Everything else goes directly to AudiobookShelf
+    # ============================================================
+
+    location / {
+        proxy_pass http://abs_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket support for real-time sync
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Timeouts
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
+    # ============================================================
+    # Fallback: proxy to ABS when cache misses
+    # ============================================================
+
+    location @abs_fallback {
+        proxy_pass http://abs_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
